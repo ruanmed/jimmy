@@ -159,6 +159,15 @@ class FilesystemWriter:
         )
         if resource.original_text is None:
             return False
+
+        if resource.original_text == "":
+            # safeguard against empty-string replacement that might cause MemoryError
+            LOGGER.warning(
+                f"Cannot replace empty original text. "
+                f'Resource might have been malformed: "{resource_markdown}".',
+            )
+            return False
+
         # replace existing link
         # Don't use re.subn(), because the link text may contein invalid characters.
         if (replacement_count := note.body.count(resource.original_text)) == 0:

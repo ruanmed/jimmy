@@ -277,7 +277,7 @@ class EndToEnd(unittest.TestCase):
     def test_formats_encrypted(self, test_input: str):
         """Test the conversion of custom formats to Markdown."""
         password = os.getenv("JIMMY_TEST_PASSWORD")
-        if password is None:
+        if not password:
             self.skipTest('Need password for encrypted test data at "JIMMY_TEST_PASSWORD"')
 
         # Pythons zipfile doesn't support AES256 encryption. Use "py7zr" instead.

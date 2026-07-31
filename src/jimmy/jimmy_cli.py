@@ -87,7 +87,7 @@ def main():
     parser_cli.add_argument(
         "--frontmatter",
         default=None,
-        choices=(None, "futo", "joplin", "obsidian", "qownnotes"),
+        choices=(None, "futo", "joplin", "obsidian", "qownnotes", "dendron"),
         help="Frontmatter type.",
     )
     parser_cli.add_argument(

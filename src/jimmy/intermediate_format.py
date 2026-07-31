@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import re
 import string
+import uuid
 
 import frontmatter
 import yaml
@@ -227,6 +228,8 @@ class Note:
             )
 
     def apply_frontmatter(self, frontmatter_: str):
+        metadata: dict = {}
+
         match frontmatter_:
             case "futo":
                 # https://gitlab.futo.org/futo-notes/futo-notes/-/blob/885231efaac35ad5b7aee0f02dcbea693931aecc/docs/markdown-spec.md#L323
@@ -246,7 +249,6 @@ class Note:
             case "joplin":
                 # https://joplinapp.org/help/dev/spec/interop_with_frontmatter/
                 # Arbitrary metadata will be ignored.
-                metadata: dict = {}
                 for field in dataclasses.fields(Note):
                     match field.name:
                         case "title" | "author" | "latitude" | "longitude" | "altitude":
@@ -267,7 +269,6 @@ class Note:
             case "obsidian":
                 # frontmatter format:
                 # https://help.obsidian.md/Editing+and+formatting/Properties#Property+format
-                metadata = {}
                 if self.tags:
                     metadata["tags"] = sorted(
                         normalize_tag_for_obsidian(tag.title) for tag in self.tags
@@ -283,6 +284,28 @@ class Note:
                         self.body, tags=" ".join(sorted(tag.title for tag in self.tags))
                     )
                     self.body = frontmatter.dumps(post)
+            case "dendron":
+                # Dendron frontmatter format:
+                # https://github.com/dendronhq/dendron-site/blob/fbc07769235bca514f88be79a523311d72c7cafd/vault/dendron.topic.frontmatter.md
+
+                # Generate a UUID - following default Dendron ID convention
+                metadata["id"] = str(uuid.uuid4().hex)[:23]
+
+                metadata["title"] = self.title
+
+                # Convert datetime to milliseconds since epoch
+                if self.created:
+                    metadata["created"] = common.datetime_to_ms(self.created)
+                if self.updated:
+                    metadata["updated"] = int(self.updated.timestamp() * 1000)
+
+                # Tags – list of strings (hierarchical if you use dots)
+                metadata["tags"] = (
+                    sorted(tag.title for tag in self.tags if tag.title)
+                )
+
+                post = frontmatter.Post(self.body, **metadata)
+                self.body = frontmatter.dumps(post)
             case _:
                 LOGGER.debug(f'Ignoring unknown frontmatter "{frontmatter_}"')
 
