@@ -15,6 +15,24 @@ import jimmy.md_lib.links
 
 
 class Converter(converter.BaseConverter):
+    # Telegram Message object `media_types`. Order defines precedence. If multiple media types are
+    # present in a message, the first one encountered will be used as the primary media.
+    MESSAGE_MEDIA_TYPES = [
+        "photo",
+        "video",
+        "voice",
+        "audio",
+        "video_message",
+        "animation",
+        "sticker",
+        "file",
+    ]
+
+    # Configurations for thumbnails, currently not externally configurable
+    include_thumbnails = True
+    inline_thumbnail = True
+    use_image_thumbnails = False
+
     def _convert_text_entities(self, text_entities: list) -> str:
         """Convert Telegram text_entities (MessageEntity) to Markdown."""
 
@@ -25,30 +43,30 @@ class Converter(converter.BaseConverter):
 
         for entity in text_entities:
             text = entity.get("text", "")
-            etype = entity.get("type", "plain")
 
-            # ---- Basic formatting ----
-            if etype == "bold":
-                text = f"**{text}**"
-            elif etype == "italic":
-                text = f"*{text}*"
-            elif etype == "underline":
-                text = f"__{text}__"  # or use <u> if Markdown not supported, but Jimmy handles __
-            elif etype == "strikethrough":
-                text = f"~~{text}~~"
-            elif etype == "code":
-                text = f"`{text}`"
-            elif etype == "pre":
-                # code block – optionally preserve language if provided (not in schema)
-                text = f"\n```\n{text}\n```\n"
+            match entity.get("type", "plain"):
+                # ---- Basic formatting ----
+                case "bold":
+                    text = f"**{text}**"
+                case "italic":
+                    text = f"*{text}*"
+                case "underline":
+                    text = f"__{text}__"
+                case "strikethrough":
+                    text = f"~~{text}~~"
+                case "code":
+                    text = f"`{text}`"
+                case "pre":
+                    # code block – optionally preserve language if provided (not in schema)
+                    text = f"\n```\n{text}\n```\n"
 
-            # ---- Links and mentions ----
-            elif etype == "text_link":
-                url = entity.get("url", "")
-                text = f"[{text}]({url})"
-            elif etype == "text_mention":
-                user_id = entity.get("user_id", "")
-                text = f"[{text}](tg://user?id={user_id})"
+                # ---- Links and mentions ----
+                case "text_link":
+                    url = entity.get("url", "")
+                    text = f"[{text}]({url})"
+                case "text_mention":
+                    user_id = entity.get("user_id", "")
+                    text = f"[{text}](tg://user?id={user_id})"
 
             # ---- Plain or already‐self‑descriptive types ----
             # mention, hashtag, bot_command, url, email, etc. are kept as plain text
@@ -87,21 +105,10 @@ class Converter(converter.BaseConverter):
             - media_markdown: the Markdown string to insert into the note body.
             - resources: list of Resource objects to be written to disk.
         """
-        # Order of precedence – if multiple exist, use the first one
-        media_fields = [
-            "photo",
-            "video",
-            "voice",
-            "audio",
-            "video_message",
-            "animation",
-            "sticker",
-            "file",
-        ]
 
         media_path = None
         media_type = None
-        for field in media_fields:
+        for field in self.MESSAGE_MEDIA_TYPES:
             if field in message and message[field]:
                 media_path = message[field]
                 media_type = field
@@ -196,7 +203,9 @@ class Converter(converter.BaseConverter):
             content = message.get("text", "")
 
         # Handle media
-        media_markdown, media_resources = self._handle_media(message)
+        media_markdown, media_resources = self._handle_media(
+            message, self.include_thumbnails, self.inline_thumbnail, self.use_image_thumbnails
+        )
 
         # Combine text and media (choose your preferred formatting)
         if content and media_markdown:
@@ -212,6 +221,60 @@ class Converter(converter.BaseConverter):
         tags = jimmy.md_lib.tags.get_inline_tags(content, ["#"])
 
         return full_content, media_resources, tags
+
+    def _get_message_datetime(self, message: dict) -> datetime:
+        """Extract Telegram message datetime."""
+
+        # 1. Primary: unixtime (most reliable)
+        if "date_unixtime" in message:
+            return common.timestamp_to_datetime(int(message["date_unixtime"]))
+
+        # 2. Secondary: ISO date string
+        if "date" in message:
+            try:
+                return common.iso_to_datetime(message["date"])
+            except ValueError, TypeError:
+                pass  # fall through
+
+        self.logger.warning(
+            "Neither 'date' nor 'date_unixtime' found, converter might need to be updated."
+        )
+
+        # 3. Tertiary: filesystem mtime of the associated media file
+        if hasattr(self, "file_map"):
+            for field in self.MESSAGE_MEDIA_TYPES:
+                if field in message and message[field]:
+                    media_rel_path = message[field]
+                    media_path = self.file_map.get(media_rel_path)
+
+                    if media_path and media_path.exists():
+                        ts_ms = common.get_ctime_mtime_ms(media_path).get("updated")
+                        if ts_ms:
+                            return common.timestamp_to_datetime(ts_ms / 1000.0)
+
+                    break  # we found a media field; no need to check others
+
+        # 4. Quaternary: mtime of the result.json (global fallback)
+        if hasattr(self, "json_fallback_ms") and self.json_fallback_ms:
+            return common.timestamp_to_datetime(self.json_fallback_ms / 1000.0)
+
+        # 5. Last resort: current time (should rarely happen)
+        self.logger.warning("No timestamp found for message, using current time.")
+        return common.timestamp_to_datetime(common.current_unix_ms() / 1000.0)
+
+    def _build_file_map(self, root_path: Path) -> dict[str, Path]:
+        """Build a file map for quick lookup."""
+
+        file_map = {}
+
+        for file_path in root_path.rglob("*"):
+            if file_path.is_file():
+                rel = file_path.relative_to(root_path)
+                file_map[str(rel)] = file_path
+                # also by filename for loose exports
+                file_map[file_path.name] = file_path
+
+        return file_map
 
     def _build_note_from_messages(
         self,
@@ -240,7 +303,7 @@ class Converter(converter.BaseConverter):
         for _, message in messages:
             content, res, tags = self._process_message(message)
 
-            message_time = common.timestamp_to_datetime(int(message["date_unixtime"]))
+            message_time = self._get_message_datetime(message)
             md_message = jimmy.md_lib.conversations.Message(
                 message.get("from", "Unknown"),
                 content,
@@ -295,7 +358,7 @@ class Converter(converter.BaseConverter):
                 # TODO: handle `service` messages with `action_` at some point
                 continue
 
-            dt = common.timestamp_to_datetime(int(message["date_unixtime"]))
+            dt = self._get_message_datetime(message)
             msg_tuples.append((dt, message))
 
         if not msg_tuples:
@@ -364,6 +427,10 @@ class Converter(converter.BaseConverter):
             self.logger.error(f"result.json not found in {file_or_folder}")
 
             return
+
+        # Store file `updated` property as instance variable for later use, if needed
+        self.json_fallback_ms = common.get_ctime_mtime_ms(json_path).get("updated")
+        self.file_map = self._build_file_map(file_or_folder)
 
         input_json = json.loads(json_path.read_text(encoding="utf-8"))
 
