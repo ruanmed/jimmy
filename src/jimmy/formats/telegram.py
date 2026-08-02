@@ -119,6 +119,11 @@ class Converter(converter.BaseConverter):
             self.root_path / media_path
         )
 
+        if not resource_path or not resource_path.exists():
+            self.logger.warning(f"Media file not found: {media_path}")
+
+            return "", []
+
         # Determine if it's an image (based on type or extension)
         is_image = media_type in ["photo", "sticker"] or common.is_image(resource_path)
         has_thumbnail = "thumbnail" in message and message["thumbnail"]
@@ -325,6 +330,7 @@ class Converter(converter.BaseConverter):
         if note is not None:
             self.root_notebook.child_notes.append(note)
 
+    @common.catch_all_exceptions()
     def convert_saved_messages_grouped_by_day(self, chat):
         if chat.get("type") != "saved_messages":
             self.logger.warning("This method is intended for 'saved_messages' chats only.")
