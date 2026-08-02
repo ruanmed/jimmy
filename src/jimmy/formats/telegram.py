@@ -185,17 +185,6 @@ class Converter(converter.BaseConverter):
 
         return main_marker, resources
 
-    def _get_message_text(self, message: dict) -> str:
-        """Extract plain text from a Telegram message, handling entity lists."""
-
-        text = message.get("text", "")
-
-        if isinstance(text, list):
-            # text is a list of entities: [{"text": "Hello", "type": "plain"}, ...]
-            return "".join(part.get("text", "") for part in text if isinstance(part, dict))
-
-        return text if isinstance(text, str) else ""
-
     def _process_message(self, message: dict) -> tuple[str, list[imf.Resource], list[str]]:
         """Process a single message, returning (full_content, resources, tags)."""
 
