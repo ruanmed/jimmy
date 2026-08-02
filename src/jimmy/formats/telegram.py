@@ -33,6 +33,9 @@ class Converter(converter.BaseConverter):
     inline_thumbnail = True
     use_image_thumbnails = False
 
+    json_fallback_ms : int | None = None
+    file_map: dict[str, Path] | None = None
+
     def _convert_text_entities(self, text_entities: list) -> str:
         """Convert Telegram text_entities (MessageEntity) to Markdown."""
 
@@ -241,7 +244,7 @@ class Converter(converter.BaseConverter):
         )
 
         # 3. Tertiary: filesystem mtime of the associated media file
-        if hasattr(self, "file_map"):
+        if self.file_map is not None:
             for field in self.MESSAGE_MEDIA_TYPES:
                 if field in message and message[field]:
                     media_rel_path = message[field]
@@ -255,7 +258,7 @@ class Converter(converter.BaseConverter):
                     break  # we found a media field; no need to check others
 
         # 4. Quaternary: mtime of the result.json (global fallback)
-        if hasattr(self, "json_fallback_ms") and self.json_fallback_ms:
+        if self.json_fallback_ms is not None:
             return common.timestamp_to_datetime(self.json_fallback_ms / 1000.0)
 
         # 5. Last resort: current time (should rarely happen)
@@ -429,8 +432,8 @@ class Converter(converter.BaseConverter):
             return
 
         # Store file `updated` property as instance variable for later use, if needed
-        self.json_fallback_ms = common.get_ctime_mtime_ms(json_path).get("updated")
-        self.file_map = self._build_file_map(file_or_folder)
+        self.json_fallback_ms : int | None = common.get_ctime_mtime_ms(json_path).get("updated")
+        self.file_map: dict[str, Path] | None = self._build_file_map(file_or_folder)
 
         input_json = json.loads(json_path.read_text(encoding="utf-8"))
 
