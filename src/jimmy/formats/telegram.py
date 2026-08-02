@@ -358,7 +358,14 @@ class Converter(converter.BaseConverter):
                 self.logger.debug(f"Created note for {day}")
 
     def convert(self, file_or_folder: Path):
-        input_json = json.loads((file_or_folder / "result.json").read_text(encoding="utf-8"))
+        json_path = file_or_folder / "result.json"
+
+        if not json_path.exists():
+            self.logger.error(f"result.json not found in {file_or_folder}")
+
+            return
+
+        input_json = json.loads(json_path.read_text(encoding="utf-8"))
 
         if (chats := input_json.get("chats")) is not None:
             self.logger.debug('Found "chats" key. Assuming that this is a complete "DataExport".')
