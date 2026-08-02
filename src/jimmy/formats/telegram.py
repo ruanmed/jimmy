@@ -16,7 +16,7 @@ import jimmy.md_lib.links
 
 class Converter(converter.BaseConverter):
     def _convert_text_entities(self, text_entities: list) -> str:
-        """Convert Telegram text_entities to Markdown."""
+        """Convert Telegram text_entities (MessageEntity) to Markdown."""
 
         if not text_entities:
             return ""
@@ -141,7 +141,10 @@ class Converter(converter.BaseConverter):
             thumb_resource_path = common.find_file_recursively(self.root_path, thumb_path) or (
                 self.root_path / thumb_path
             )
-            thumb_marker = f"![Thumbnail]({thumb_resource_path})"
+
+            thumb_marker = jimmy.md_lib.links.make_link(
+                "Thumbnail", str(thumb_resource_path), is_image=True
+            )
             thumb_name = f"thumbnail_{Path(thumb_path).name}"
 
             thumb_resource = imf.Resource(
@@ -153,17 +156,16 @@ class Converter(converter.BaseConverter):
             resources.append(thumb_resource)
 
         # 4. Build the main media marker
-        if is_image and not use_thumbnail_for_marker:
-            # Display the image directly
-            main_marker = f"![{file_name}]({resource_path})"
-            main_title = file_name
-        elif use_thumbnail_for_marker:
+        if use_thumbnail_for_marker:
             # Use the thumbnail as a clickable link to the main media
-            main_marker = f"[{thumb_marker}]({resource_path})"
+            main_marker = jimmy.md_lib.links.make_link(
+                str(thumb_marker), str(resource_path), is_image=False
+            )
             main_title = thumb_marker
         else:
-            # Plain file link (no thumbnail inline)
-            main_marker = f"[{file_name}]({resource_path})"
+            main_marker = jimmy.md_lib.links.make_link(
+                file_name, str(resource_path), is_image=is_image
+            )
             main_title = file_name
 
         # 5. Create the main media resource
@@ -189,10 +191,8 @@ class Converter(converter.BaseConverter):
 
         return text if isinstance(text, str) else ""
 
-    def _process_message(
-        self, message: dict, dt: datetime
-    ) -> tuple[str, list[imf.Resource], list[str]]:
-        """Process a single message, returning (body_line, resources, tags)."""
+    def _process_message(self, message: dict) -> tuple[str, list[imf.Resource], list[str]]:
+        """Process a single message, returning (full_content, resources, tags)."""
 
         # Get the rich text if available
         if "text_entities" in message:
@@ -217,11 +217,7 @@ class Converter(converter.BaseConverter):
         # Extract tags from the original text (before media markdown)
         tags = jimmy.md_lib.tags.get_inline_tags(content, ["#"])
 
-        sender = message.get("from", "Unknown")
-        time_str = dt.strftime("%H:%M:%S")
-        body_line = f"{time_str}, **{sender}**: {full_content}"
-
-        return body_line, media_resources, tags
+        return full_content, media_resources, tags
 
     def _build_note_from_messages(
         self,
@@ -243,19 +239,34 @@ class Converter(converter.BaseConverter):
         note.created = first_date
         note.updated = last_date
 
-        body_lines = []
+        md_conversation = jimmy.md_lib.conversations.Conversation()
         resources = []
         all_tags = []
 
-        for dt, message in messages:
-            line, res, tags = self._process_message(message, dt)
-            body_lines.append(line)
+        for _, message in messages:
+            content, res, tags = self._process_message(message)
+
+            message_time = common.timestamp_to_datetime(int(message["date_unixtime"]))
+            md_message = jimmy.md_lib.conversations.Message(
+                message.get("from", "Unknown"),
+                content,
+                prefix=message_time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            # md_message.attachment_links.extend(resource.original_text for resource in res)
+            md_conversation.messages.append(md_message)
+
             resources.extend(res)
             all_tags.extend(tags)
 
-        note.body = "\n\n".join(body_lines)
+        note.body = md_conversation.to_md()
         note.resources = resources
         note.tags = [imf.Tag(tag) for tag in dict.fromkeys(all_tags)]
+
+        if not note.body and not note.resources and not note.tags:
+            self.logger.debug("Skipping empty chat.")
+
+            return None
 
         frontmatter = {
             "chat_id": chat_id,
@@ -286,6 +297,8 @@ class Converter(converter.BaseConverter):
 
         for message in messages:
             if message.get("type") != "message":
+                # The type is `message` for regular messages and `service` for service messages
+                # TODO: handle `service` messages with `action_` at some point
                 continue
 
             dt = common.timestamp_to_datetime(int(message["date_unixtime"]))
@@ -308,7 +321,7 @@ class Converter(converter.BaseConverter):
         )
 
         # Handle creation time from a service message if needed
-        # (you can add that logic before building or inside)
+        # (logic can add that be added before building or inside)
         if note is not None:
             self.root_notebook.child_notes.append(note)
 
