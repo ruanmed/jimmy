@@ -33,7 +33,16 @@ class Converter(converter.BaseConverter):
     inline_thumbnail = True
     use_image_thumbnails = False
 
-    json_fallback_ms : int | None = None
+    # Configurations for locations, currently not externally configurable
+    include_locations = True
+
+    # Configurations for contacts, currently not externally configurable
+    include_contacts = True
+
+    # Configurations for reactions, currently not externally configurable
+    include_reactions = True
+
+    json_fallback_ms: int | None = None
     file_map: dict[str, Path] | None = None
 
     def _convert_text_entities(self, text_entities: list) -> str:
@@ -60,8 +69,12 @@ class Converter(converter.BaseConverter):
                 case "code":
                     text = f"`{text}`"
                 case "pre":
-                    # code block – optionally preserve language if provided (not in schema)
+                    # code block - optionally preserve language if provided (not in schema)
                     text = f"\n```\n{text}\n```\n"
+
+                # case "spoiler":
+                # spoiler block - no native Markdown spoiler syntax
+                # TODO: implement spoiler handling if Jimmy decides to support it
 
                 # ---- Links and mentions ----
                 case "text_link":
@@ -195,9 +208,135 @@ class Converter(converter.BaseConverter):
 
         return main_marker, resources
 
-    def _process_message(self, message: dict) -> tuple[str, list[imf.Resource], list[str]]:
-        """Process a single message, returning (full_content, resources, tags)."""
+    def _handle_location(self, message: dict) -> tuple[str, list[str]]:
+        """
+        Process location_information from a message.
 
+        Returns:
+            (extra_markdown, tags_to_add)
+        """
+        if "location_information" not in message:
+            return "", []
+
+        location = message["location_information"]
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+
+        if latitude is None or longitude is None:
+            return "", []
+
+        extra = f"\n\n📍 Location: {latitude:.6f}, {longitude:.6f}"
+
+        return extra, ["location"]
+
+    def _handle_contact(self, message: dict) -> tuple[str, list[imf.Resource]]:
+        """
+        Process contact_information and contact_vcard from a message.
+
+        Returns:
+            (extra_markdown, list_of_resources)
+        """
+        if "contact_information" not in message and "contact_vcard" not in message:
+            return "", []
+
+        contact_info = message.get("contact_information", {})
+        vcard_rel = message.get("contact_vcard")
+
+        first = contact_info.get("first_name", "")
+        last = contact_info.get("last_name", "")
+        phone = contact_info.get("phone_number", "")
+        name = f"{first} {last}".strip() or "Unknown"
+
+        # Build descriptive line
+        contact_line = f"📇 Contact: {name}"
+
+        if phone:
+            contact_line += f" (phone: {phone})"
+
+        resources = []
+
+        # Generate the vCard Jimmy intermediate resource
+        if vcard_rel:
+            vcard_path = self._locate_resource(vcard_rel)
+
+            if vcard_path is not None:
+                vcard_marker = jimmy.md_lib.links.make_link(
+                    Path(vcard_rel).name, str(vcard_path), is_image=False
+                )
+
+                contact_line += f" (vCard: {vcard_marker})"
+
+                vcard_resource = imf.Resource(
+                    filename=vcard_path,
+                    original_text=vcard_marker,
+                    title=Path(vcard_rel).name,
+                )
+
+                resources.append(vcard_resource)
+            else:
+                self.logger.warning(f"vCard file not found: {vcard_rel}")
+
+                contact_line += f" ((vCard: {vcard_rel} (missing))"
+
+        extra = f"\n\n{contact_line}"
+
+        return extra, resources
+
+    def _handle_reactions(self, message: dict) -> tuple[str, dict]:
+        """
+        Process reactions from a message.
+
+        Returns:
+            (extra_markdown, reactions_data_dict)
+        """
+        reactions_data = message.get("reactions")
+        if not reactions_data:
+            return "", {}
+
+        parts = []
+        for reaction in reactions_data:
+            emoji = reaction.get("emoji", "")
+            count = reaction.get("count", 0)
+            recent = reaction.get("recent", [])
+            reactors = [u.get("from", "?") for u in recent[:3]]
+            reactor_str = ", ".join(reactors) if reactors else ""
+
+            if count > 1 and reactor_str:
+                parts.append(f"{emoji} ({count}) - {reactor_str}")
+            elif count == 1 and reactor_str:
+                parts.append(f"{emoji} - {reactor_str}")
+            else:
+                parts.append(f"{emoji} ({count})")
+
+        if not parts:
+            return "", {}
+
+        extra = "\n\nReactions: " + " | ".join(parts)
+
+        return extra, {"reactions": reactions_data}  # wrap for frontmatter
+
+    def _process_message(
+        self,
+        message: dict,
+        include_location: bool = True,
+        include_contact: bool = True,
+        include_reactions: bool = True,
+    ) -> tuple[str, list[imf.Resource], list[str], dict[str, list[dict]]]:
+        """
+        Process a single message, returning (full_content, resources, tags, frontmatter_extra).
+
+        Parameters:
+            include_location (bool):
+                If True, parse and include location data from `location_information`.
+            include_contact (bool):
+                If True, parse and include contact data from `contact_information`
+                and attach the `.vcard` file if present.
+            include_reactions (bool):
+                If True, parse and include reaction summaries and return the raw
+                reaction data in the `frontmatter_extra` dict.
+        """
+
+        # 1. Basic text content
         # Get the rich text if available
         if "text_entities" in message:
             content = self._convert_text_entities(message["text_entities"])
@@ -205,7 +344,7 @@ class Converter(converter.BaseConverter):
             # Fallback to plain text (for older exports or simple messages)
             content = message.get("text", "")
 
-        # Handle media
+        # 2. Handle media
         media_markdown, media_resources = self._handle_media(
             message, self.include_thumbnails, self.inline_thumbnail, self.use_image_thumbnails
         )
@@ -220,10 +359,36 @@ class Converter(converter.BaseConverter):
         else:
             full_content = content
 
+        # 3. Tags from inline #hashtags
         # Extract tags from the original text (before media markdown)
         tags = jimmy.md_lib.tags.get_inline_tags(content, ["#"])
 
-        return full_content, media_resources, tags
+        # --- Initialize optional extras with safe defaults ---
+        location_extra = ""
+        contact_extra = ""
+        reactions_extra = ""
+        contact_resources = []
+        reactions_frontmatter = {}
+
+        # 4. Handle location
+        if include_location:
+            location_extra, location_tags = self._handle_location(message)
+
+            tags.extend(location_tags)
+
+        # 5. Handle contact
+        if include_contact:
+            contact_extra, contact_resources = self._handle_contact(message)
+
+        # 6. Handle reactions
+        if include_reactions:
+            reactions_extra, reactions_frontmatter = self._handle_reactions(message)
+
+        # 7. Assemble final content and resources
+        full_content += location_extra + contact_extra + reactions_extra
+        resources = media_resources + contact_resources
+
+        return full_content, resources, tags, reactions_frontmatter
 
     def _get_message_datetime(self, message: dict) -> datetime:
         """Extract Telegram message datetime."""
@@ -248,10 +413,11 @@ class Converter(converter.BaseConverter):
             for field in self.MESSAGE_MEDIA_TYPES:
                 if field in message and message[field]:
                     media_rel_path = message[field]
-                    media_path = self.file_map.get(media_rel_path)
+                    media_path = self._locate_resource(media_rel_path)
 
-                    if media_path and media_path.exists():
+                    if media_path is not None:
                         ts_ms = common.get_ctime_mtime_ms(media_path).get("updated")
+
                         if ts_ms:
                             return common.timestamp_to_datetime(ts_ms / 1000.0)
 
@@ -264,6 +430,16 @@ class Converter(converter.BaseConverter):
         # 5. Last resort: current time (should rarely happen)
         self.logger.warning("No timestamp found for message, using current time.")
         return common.timestamp_to_datetime(common.current_unix_ms() / 1000.0)
+
+    def _locate_resource(self, rel_path: str) -> Path | None:
+        """Locate an existing resource file in root_path, using the file_map if available."""
+
+        if self.file_map and rel_path in self.file_map:
+            candidate = self.file_map[rel_path]
+        else:
+            candidate = self.root_path / rel_path
+
+        return candidate if candidate.exists() else None
 
     def _build_file_map(self, root_path: Path) -> dict[str, Path]:
         """Build a file map for quick lookup."""
@@ -286,6 +462,7 @@ class Converter(converter.BaseConverter):
         original_id: str,
         chat_id: int,
         extra_frontmatter: dict | None = None,
+        include_location: bool = True,
     ) -> imf.Note | None:
         """Create a Note from a sorted list of (datetime, message) tuples."""
 
@@ -302,9 +479,15 @@ class Converter(converter.BaseConverter):
         md_conversation = jimmy.md_lib.conversations.Conversation()
         resources = []
         all_tags = []
+        all_reactions = []
 
         for _, message in messages:
-            content, res, tags = self._process_message(message)
+            content, res, tags, reactions = self._process_message(
+                message,
+                include_location=self.include_locations,
+                include_contact=self.include_contacts,
+                include_reactions=self.include_reactions,
+            )
 
             message_time = self._get_message_datetime(message)
             md_message = jimmy.md_lib.conversations.Message(
@@ -319,9 +502,23 @@ class Converter(converter.BaseConverter):
             resources.extend(res)
             all_tags.extend(tags)
 
+            # TODO: decide if this is necessary
+            if reactions:
+                all_reactions.append(reactions)
+
         note.body = md_conversation.to_md()
         note.resources = resources
         note.tags = [imf.Tag(tag) for tag in dict.fromkeys(all_tags)]
+
+        if include_location:
+            # If there is at least one location, set note.latitude/longitude from the first occurrence
+            for _, message in messages:
+                if "location_information" in message:
+                    note.latitude = message["location_information"].get("latitude")
+                    note.longitude = message["location_information"].get("longitude")
+
+                    break
+
 
         if not note.body and not note.resources and not note.tags:
             self.logger.debug("Skipping empty chat.")
@@ -334,6 +531,9 @@ class Converter(converter.BaseConverter):
             "created": first_date.isoformat(),
             "updated": last_date.isoformat(),
         }
+
+        if all_reactions:
+            frontmatter["reactions"] = all_reactions
 
         if extra_frontmatter:
             frontmatter.update(extra_frontmatter)
@@ -378,6 +578,7 @@ class Converter(converter.BaseConverter):
             original_id=str(chat["id"]),
             chat_id=chat.get("id"),
             extra_frontmatter={"chat_type": chat.get("type")},
+            include_location=self.include_locations,
         )
 
         # Handle creation time from a service message if needed
@@ -409,7 +610,7 @@ class Converter(converter.BaseConverter):
 
         for day, msg_list in messages_by_day.items():
             msg_list.sort(key=lambda x: x[0])  # already sorted, but ensure
-            title = f"Saved Messages – {day.isoformat()}"
+            title = f"Saved Messages - {day.isoformat()}"
 
             note = self._build_note_from_messages(
                 msg_list,
@@ -417,6 +618,7 @@ class Converter(converter.BaseConverter):
                 original_id=f"{chat['id']}_{day.isoformat()}",
                 chat_id=chat.get("id"),
                 extra_frontmatter={"date": day.isoformat()},
+                include_location=self.include_locations,
             )
 
             if note:
@@ -432,7 +634,7 @@ class Converter(converter.BaseConverter):
             return
 
         # Store file `updated` property as instance variable for later use, if needed
-        self.json_fallback_ms : int | None = common.get_ctime_mtime_ms(json_path).get("updated")
+        self.json_fallback_ms: int | None = common.get_ctime_mtime_ms(json_path).get("updated")
         self.file_map: dict[str, Path] | None = self._build_file_map(file_or_folder)
 
         input_json = json.loads(json_path.read_text(encoding="utf-8"))
