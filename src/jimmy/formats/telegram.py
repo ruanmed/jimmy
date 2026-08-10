@@ -282,7 +282,7 @@ class Converter(converter.BaseConverter):
 
         return extra, resources
 
-    def _handle_reactions(self, message: dict) -> tuple[str, dict]:
+    def _handle_reactions(self, message: dict) -> tuple[str, dict[str, list]]:
         """
         Process reactions from a message.
 
@@ -367,8 +367,8 @@ class Converter(converter.BaseConverter):
         location_extra = ""
         contact_extra = ""
         reactions_extra = ""
-        contact_resources = []
-        reactions_frontmatter = {}
+        contact_resources: list[imf.Resource] = []
+        reactions_frontmatter: dict[str, list] = {}
 
         # 4. Handle location
         if include_location:
@@ -461,8 +461,8 @@ class Converter(converter.BaseConverter):
         title: str,
         original_id: str,
         chat_id: int,
+        *,
         extra_frontmatter: dict | None = None,
-        include_location: bool = True,
     ) -> imf.Note | None:
         """Create a Note from a sorted list of (datetime, message) tuples."""
 
@@ -510,8 +510,8 @@ class Converter(converter.BaseConverter):
         note.resources = resources
         note.tags = [imf.Tag(tag) for tag in dict.fromkeys(all_tags)]
 
-        if include_location:
-            # If there is at least one location, set note.latitude/longitude from the first occurrence
+        if self.include_locations:
+            # If there is at least one location, set note.latitude/longitude from first occurrence
             for _, message in messages:
                 if "location_information" in message:
                     note.latitude = message["location_information"].get("latitude")
@@ -578,7 +578,6 @@ class Converter(converter.BaseConverter):
             original_id=str(chat["id"]),
             chat_id=chat.get("id"),
             extra_frontmatter={"chat_type": chat.get("type")},
-            include_location=self.include_locations,
         )
 
         # Handle creation time from a service message if needed
@@ -618,7 +617,6 @@ class Converter(converter.BaseConverter):
                 original_id=f"{chat['id']}_{day.isoformat()}",
                 chat_id=chat.get("id"),
                 extra_frontmatter={"date": day.isoformat()},
-                include_location=self.include_locations,
             )
 
             if note:
