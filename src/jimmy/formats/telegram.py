@@ -85,10 +85,10 @@ class Converter(converter.BaseConverter):
                 # ---- Links and mentions ----
                 case TelegramMessageEntity.TEXT_LINK:
                     url = entity.get("url", "")
-                    text = f"[{text}]({url})"
-                case "text_mention":
+                    text = jimmy.md_lib.links.make_link(text, url)
+                case TelegramMessageEntity.MENTION_NAME:
                     user_id = entity.get("user_id", "")
-                    text = f"[{text}](tg://user?id={user_id})"
+                    text = jimmy.md_lib.links.make_link(text, f"tg://user?id={user_id}")
 
             # ---- Plain or already‐self‑descriptive types ----
             # mention, hashtag, bot_command, url, email, etc. are kept as plain text
