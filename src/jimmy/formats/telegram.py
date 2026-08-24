@@ -69,7 +69,7 @@ class Converter(converter.BaseConverter):
                 case TelegramMessageEntity.ITALIC:
                     text = f"*{text}*"
                 case TelegramMessageEntity.UNDERLINE:
-                    text = f"__{text}__"
+                    text = f"++{text}++"
                 case TelegramMessageEntity.STRIKETHROUGH:
                     text = f"~~{text}~~"
                 case TelegramMessageEntity.CODE:
