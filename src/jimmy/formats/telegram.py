@@ -6,8 +6,11 @@ Based on Telegram Data Export Schema: <https://core.telegram.org/import-export>
 
 from collections import defaultdict
 from datetime import datetime
+import enum
+from enum import auto
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 from jimmy import common, converter, intermediate_format as imf
 import jimmy.md_lib.conversations
@@ -45,6 +48,9 @@ class Converter(converter.BaseConverter):
     json_fallback_ms: int | None = None
     file_map: dict[str, Path] | None = None
 
+
+    referenced_messages: set[str] = set()
+
     def _convert_text_entities(self, text_entities: list) -> str:
         """Convert Telegram text_entities (MessageEntity) to Markdown."""
 
@@ -58,17 +64,17 @@ class Converter(converter.BaseConverter):
 
             match entity.get("type", "plain"):
                 # ---- Basic formatting ----
-                case "bold":
+                case TelegramMessageEntity.BOLD:
                     text = f"**{text}**"
-                case "italic":
+                case TelegramMessageEntity.ITALIC:
                     text = f"*{text}*"
-                case "underline":
+                case TelegramMessageEntity.UNDERLINE:
                     text = f"__{text}__"
-                case "strikethrough":
+                case TelegramMessageEntity.STRIKETHROUGH:
                     text = f"~~{text}~~"
-                case "code":
+                case TelegramMessageEntity.CODE:
                     text = f"`{text}`"
-                case "pre":
+                case TelegramMessageEntity.PRE:
                     # code block - optionally preserve language if provided (not in schema)
                     text = f"\n```\n{text}\n```\n"
 
@@ -77,7 +83,7 @@ class Converter(converter.BaseConverter):
                 # TODO: implement spoiler handling if Jimmy decides to support it
 
                 # ---- Links and mentions ----
-                case "text_link":
+                case TelegramMessageEntity.TEXT_LINK:
                     url = entity.get("url", "")
                     text = f"[{text}]({url})"
                 case "text_mention":
@@ -91,6 +97,53 @@ class Converter(converter.BaseConverter):
             parts.append(text)
 
         return "".join(parts)
+
+    def _handle_action(
+        self, telegram_message: TelegramMessageWrapper
+    ) -> tuple[str, list[imf.Resource]]:
+        """
+        Process service action messages.
+
+        Returns (markdown_text, resources) for the action.
+        """
+        message, chat_id, chat_type = telegram_message
+
+        action = message.get("action")
+
+        if not action:
+            return "", []
+
+        actor = message.get("actor", "Someone")
+        # actor_id = message.get("actor_id", None)
+
+        # ---- Supported actions ----
+        match action:
+            case TelegramServiceMessageAction.PIN_MESSAGE:
+                pinned_msg_id = message.get("message_id")
+
+                if pinned_msg_id is None:
+                    self.logger.warning("pin_message action missing message_id")
+
+                    return "", []
+
+                # Build an anchor that can be used in the final output.
+                # If we have chat context, make it unique; otherwise fallback.
+                anchor = generate_anchor(pinned_msg_id, chat_id=chat_id, chat_type=chat_type)
+
+                self.referenced_messages.add(anchor)
+
+                link = jimmy.md_lib.links.make_link("this message", f"#{anchor}", is_image=False)
+
+                markdown = f"**{actor}** pinned {link}"
+
+                return markdown, []
+
+        # ---- Unknown actions ----
+        # Log but still produce a descriptive line
+        self.logger.debug(f"Unhandled service action: {action}")
+        markdown = f"Service action: {action} (by {actor})"
+
+        return markdown, []
 
     def _handle_media(
         self,
@@ -124,10 +177,12 @@ class Converter(converter.BaseConverter):
 
         media_path = None
         media_type = None
+
         for field in self.MESSAGE_MEDIA_TYPES:
             if field in message and message[field]:
                 media_path = message[field]
                 media_type = field
+
                 break
 
         if not media_path:
@@ -317,7 +372,7 @@ class Converter(converter.BaseConverter):
 
     def _process_message(
         self,
-        message: dict,
+        telegram_message: TelegramMessageWrapper,
         include_location: bool = True,
         include_contact: bool = True,
         include_reactions: bool = True,
@@ -335,6 +390,7 @@ class Converter(converter.BaseConverter):
                 If True, parse and include reaction summaries and return the raw
                 reaction data in the `frontmatter_extra` dict.
         """
+        message = telegram_message.message
 
         # 1. Basic text content
         # Get the rich text if available
@@ -348,6 +404,12 @@ class Converter(converter.BaseConverter):
         media_markdown, media_resources = self._handle_media(
             message, self.include_thumbnails, self.inline_thumbnail, self.use_image_thumbnails
         )
+
+        # ---- 2.5 Handle service action ----
+        action_markdown, action_resources = self._handle_action(telegram_message)
+
+        if action_markdown:
+            content += f"{content}\n\n{action_markdown}" if content else action_markdown
 
         # Combine text and media (choose your preferred formatting)
         if content and media_markdown:
@@ -386,7 +448,7 @@ class Converter(converter.BaseConverter):
 
         # 7. Assemble final content and resources
         full_content += location_extra + contact_extra + reactions_extra
-        resources = media_resources + contact_resources
+        resources = media_resources + contact_resources + action_resources
 
         return full_content, resources, tags, reactions_frontmatter
 
@@ -457,7 +519,7 @@ class Converter(converter.BaseConverter):
 
     def _build_note_from_messages(
         self,
-        messages: list[tuple[datetime, dict]],
+        messages: list[tuple[datetime, TelegramMessageWrapper]],
         title: str,
         original_id: str,
         chat_id: int,
@@ -481,19 +543,40 @@ class Converter(converter.BaseConverter):
         all_tags = []
         all_reactions = []
 
-        for _, message in messages:
+        for _, telegram_message in messages:
+
             content, res, tags, reactions = self._process_message(
-                message,
+                telegram_message,
                 include_location=self.include_locations,
                 include_contact=self.include_contacts,
                 include_reactions=self.include_reactions,
             )
 
-            message_time = self._get_message_datetime(message)
+            message_type = telegram_message.message.get("type")
+
+            if message_type == TelegramMessageType.SERVICE:
+                message_author = "System"
+            else:
+                message_author = telegram_message.message.get("from", "Unknown")
+
+            message_time = self._get_message_datetime(telegram_message.message)
+            message_prefix = message_time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+            # Handle additional anchors from note links
+            if telegram_message.anchor in self.referenced_messages:
+                message_id = telegram_message.message.get("id")
+
+                self.logger.debug(f"Adding anchor for message {message_id}")
+
+                # <a id="section_id"></a>
+                message_prefix=f"""<a id="{telegram_message.anchor}"></a>\n{message_prefix}"""
+
+
             md_message = jimmy.md_lib.conversations.Message(
-                message.get("from", "Unknown"),
+                message_author,
                 content,
-                prefix=message_time.strftime("%Y-%m-%d %H:%M:%S"),
+                prefix=message_prefix,
             )
 
             # md_message.attachment_links.extend(resource.original_text for resource in res)
@@ -512,13 +595,12 @@ class Converter(converter.BaseConverter):
 
         if self.include_locations:
             # If there is at least one location, set note.latitude/longitude from first occurrence
-            for _, message in messages:
+            for _, (message, _, _) in messages:
                 if "location_information" in message:
                     note.latitude = message["location_information"].get("latitude")
                     note.longitude = message["location_information"].get("longitude")
 
                     break
-
 
         if not note.body and not note.resources and not note.tags:
             self.logger.debug("Skipping empty chat.")
@@ -542,27 +624,68 @@ class Converter(converter.BaseConverter):
 
         return note
 
+    def _register_references(
+        self, message: dict, chat_id = int | None, chat_type = str | None
+    ) -> None:
+        """
+        Process messages registering all internal references to other telegram chats/messages.
+
+        TODO: Currently only implemented pin message action references, others to be implemented.
+        """
+        action = message.get("action")
+
+        if not action:
+            return
+
+        # actor_id = message.get("actor_id", None)
+
+        # ---- Supported actions ----
+        match action:
+            case TelegramServiceMessageAction.PIN_MESSAGE:
+                pinned_msg_id = message.get("message_id")
+
+                if pinned_msg_id is None:
+                    self.logger.warning("pin_message action missing message_id")
+
+                    return
+
+                anchor = generate_anchor(pinned_msg_id, chat_id=chat_id, chat_type=chat_type)
+
+                self.referenced_messages.add(anchor)
+
+                return
+
+        # ---- Unknown actions ----
+        # Not handled right now
+
+        return
+
     @common.catch_all_exceptions()
-    def convert_note(self, chat):
-        if chat.get("type", "") == "saved_messages":
+    def convert_note(self, chat: TelegramChat):
+        chat_id, chat_name, chat_type, chat_messages = chat
+
+        if chat_type == TelegramChatType.SAVED_MESSAGES:
             title = "Saved Messages"
         else:
-            title = chat.get("name", "Unnamed Chat")
+            title = chat_name or "Unnamed Chat"
+
         self.logger.debug(f'Converting chat "{title}"')
 
-        messages = chat.get("messages", [])
+        messages = chat_messages or []
 
         # Filter out non‑message events and create list of (dt, msg)
         msg_tuples = []
 
         for message in messages:
-            if message.get("type") != "message":
-                # The type is `message` for regular messages and `service` for service messages
-                # TODO: handle `service` messages with `action_` at some point
+            if message.get("type") not in TelegramMessageType:
                 continue
 
             dt = self._get_message_datetime(message)
-            msg_tuples.append((dt, message))
+            telegram_message = TelegramMessageWrapper(message, chat_id, chat_type)
+            msg_tuples.append((dt, telegram_message))
+
+            # Register all internal messages references
+            self._register_references(message, chat_id, chat_type)
 
         if not msg_tuples:
             self.logger.debug(f"No regular messages in chat '{title}', skipping.")
@@ -575,9 +698,9 @@ class Converter(converter.BaseConverter):
         note = self._build_note_from_messages(
             msg_tuples,
             title=title,
-            original_id=str(chat["id"]),
-            chat_id=chat.get("id"),
-            extra_frontmatter={"chat_type": chat.get("type")},
+            original_id=str(chat_id),
+            chat_id=chat_id,
+            extra_frontmatter={"chat_type": chat_type},
         )
 
         # Handle creation time from a service message if needed
@@ -586,8 +709,10 @@ class Converter(converter.BaseConverter):
             self.root_notebook.child_notes.append(note)
 
     @common.catch_all_exceptions()
-    def convert_saved_messages_grouped_by_day(self, chat):
-        if chat.get("type") != "saved_messages":
+    def convert_saved_messages_grouped_by_day(self, chat: TelegramChat):
+        chat_id, _, chat_type, chat_messages = chat
+
+        if chat_type != TelegramChatType.SAVED_MESSAGES:
             self.logger.warning("This method is intended for 'saved_messages' chats only.")
             self.convert_note(chat)
 
@@ -595,12 +720,18 @@ class Converter(converter.BaseConverter):
 
         messages_by_day = defaultdict(list)
 
-        for message in chat.get("messages", []):
-            if message.get("type") != "message":
+        messages = chat_messages or []
+
+        for message in messages:
+            if message.get("type") not in TelegramMessageType:
                 continue
 
             dt = common.timestamp_to_datetime(int(message["date_unixtime"]))
-            messages_by_day[dt.date()].append((dt, message))
+            telegram_message = TelegramMessageWrapper(message, chat_id, chat_type)
+            messages_by_day[dt.date()].append((dt, telegram_message))
+
+            # Register all internal messages references
+            self._register_references(message, chat_id, chat_type)
 
         if not messages_by_day:
             self.logger.debug("No regular messages found in saved messages chat.")
@@ -609,13 +740,14 @@ class Converter(converter.BaseConverter):
 
         for day, msg_list in messages_by_day.items():
             msg_list.sort(key=lambda x: x[0])  # already sorted, but ensure
+
             title = f"Saved Messages - {day.isoformat()}"
 
             note = self._build_note_from_messages(
                 msg_list,
                 title=title,
-                original_id=f"{chat['id']}_{day.isoformat()}",
-                chat_id=chat.get("id"),
+                original_id=f"{chat_id}_{day.isoformat()}",
+                chat_id=chat_id,
                 extra_frontmatter={"date": day.isoformat()},
             )
 
@@ -638,19 +770,198 @@ class Converter(converter.BaseConverter):
         input_json = json.loads(json_path.read_text(encoding="utf-8"))
 
         if (chats := input_json.get("chats")) is not None:
-            self.logger.debug('Found "chats" key. Assuming that this is a complete "DataExport".')
+            self.logger.info('Found "chats" key. Assuming that this is a complete "DataExport".')
 
             for chat in chats["list"]:
+                telegram_chat = TelegramChat(**chat)
+
                 # Dispatch: if it's Saved Messages, group by day; otherwise use normal conversion
-                if chat.get("type") == "saved_messages":
-                    self.convert_saved_messages_grouped_by_day(chat)
+                if telegram_chat.type == TelegramChatType.SAVED_MESSAGES:
+                    self.convert_saved_messages_grouped_by_day(telegram_chat)
                 else:
-                    self.convert_note(chat)
+                    self.convert_note(telegram_chat)
         else:
-            self.logger.debug('No "chats" key. Assuming that this is a single "ChatExport".')
+            self.logger.info('No "chats" key. Assuming that this is a single "ChatExport".')
+
+            telegram_chat = TelegramChat(**input_json)
 
             # For a single export, check if it's Saved Messages
-            if input_json.get("type") == "saved_messages":
-                self.convert_saved_messages_grouped_by_day(input_json)
+            if telegram_chat.type == TelegramChatType.SAVED_MESSAGES:
+                self.convert_saved_messages_grouped_by_day(telegram_chat)
             else:
-                self.convert_note(input_json)
+                self.convert_note(telegram_chat)
+
+
+class TelegramChat(NamedTuple):
+    """
+    Represents a chat object from a Telegram Export Data file.
+
+    This structure mirrors the chat metadata and its associated messages as
+    defined in the Telegram chat export JSON schema. It is designed to be
+    lightweight and immutable.
+
+    Attributes:
+        id (int): Unique identifier for this chat.
+            **Important:** This number may have more than 32 significant bits.
+            While it has at most 52 significant bits, some programming languages
+            may have difficulty interpreting it. Use a signed 64-bit integer or
+            double-precision float type to store this identifier safely.
+        name (str | None): The display name of the chat (e.g., group title,
+            user's full name, or channel name). May be None if not applicable.
+        type (str | None): The structural category of the chat. Valid values
+            are one of the mapped strings at `TelegramChatType`
+            May be None if the type is unknown or not present in the export.
+        messages (list): A list of message objects contained within this chat.
+            **Note:** For public groups and channel exports, this list will
+            only contain messages that were sent by the user who requested the
+            export, not all messages from the conversation.
+    """
+    id: int
+    name: str | None
+    type: str | None
+    messages: list
+
+
+class TelegramMessageWrapper(NamedTuple):
+    """An internal wrapper for a Telegram Message object dict."""
+    message: dict
+    chat_id: int | None
+    chat_type: str | None
+
+    @property
+    def anchor(self) -> str:
+        message_id: str | int | None = self.message.get("id")
+
+        return generate_anchor(message_id, chat_id=self.chat_id, chat_type=self.chat_type)
+
+
+def generate_anchor(
+        message_id: str | int | None, chat_id : int | None, chat_type: str | None
+    ) -> str:
+    anchor_prefix = "telegram-message-"
+
+    if chat_type is not None and chat_id is not None:
+        return f"{anchor_prefix}{chat_type}-{chat_id}-{message_id}"
+
+    return f"{anchor_prefix}{message_id}"
+
+
+class TelegramChatType(enum.StrEnum):
+    """
+    Telegram Chat type.
+
+    This is the `type` field in a Telegram chat export Chat object.
+    """
+    SAVED_MESSAGES      = auto()
+    REPLIES             = auto()
+    PERSONAL_CHAT       = auto()
+    BOT_CHAT            = auto()
+    PRIVATE_GROUP       = auto()
+    PRIVATE_SUPERGROUP  = auto()
+    PUBLIC_SUPERGROUP   = auto()
+    PRIVATE_CHANNEL     = auto()
+    PUBLIC_CHANNEL      = auto()
+
+
+class TelegramMessageType(enum.StrEnum):
+    """
+    Telegram Message type.
+
+    This is the `type` field in a Telegram chat export Message object.
+    """
+
+    MESSAGE = auto()
+    SERVICE = auto()
+
+
+class TelegramMessageEntity(enum.StrEnum):
+    """
+    Telegram MessageEntity types.
+
+    This is the `type` field in a Telegram chat export MessageEntity object.
+    """
+
+    UNKNOWN       = auto()
+    MENTION       = auto()
+    HASHTAG       = auto()
+    BOT_COMMAND   = auto()
+    LINK          = auto()
+    EMAIL         = auto()
+    BOLD          = auto()
+    ITALIC        = auto()
+    CODE          = auto()
+    PRE           = auto()
+    PLAIN         = auto()
+    TEXT_LINK     = auto()
+    MENTION_NAME  = auto()
+    PHONE         = auto()
+    CASHTAG       = auto()
+    UNDERLINE     = auto()
+    STRIKETHROUGH = auto()
+    BLOCKQUOTE    = auto()
+    BANK_CARD     = auto()
+    SPOILER       = auto()
+    CUSTOM_EMOJI  = auto()
+
+
+class TelegramMessageMediaType(enum.StrEnum):
+    """
+    Telegram Message media types.
+
+    This is the `media_type` field in a Telegram chat export Message object.
+    """
+
+    STICKER       = auto()
+    VIDEO_MESSAGE = auto()
+    VOICE_MESSAGE = auto()
+    ANIMATION     = auto()
+    VIDEO_FILE    = auto()
+    AUDIO_FILE    = auto()
+
+
+class TelegramServiceMessageAction(enum.StrEnum):
+    """
+    Telegram Service message action options.
+
+    This is the `action` field in a Telegram chat export Message object.
+    """
+
+    CREATE_GROUP            = auto()
+    EDIT_GROUP_TITLE        = auto()
+    EDIT_GROUP_PHOTO        = auto()
+    DELETE_GROUP_PHOTO      = auto()
+    INVITE_MEMBERS          = auto()
+    REMOVE_MEMBERS          = auto()
+    JOIN_GROUP_BY_LINK      = auto()
+    CREATE_CHANNEL          = auto()
+    MIGRATE_TO_SUPERGROUP   = auto()
+    MIGRATE_FROM_GROUP      = auto()
+    PIN_MESSAGE             = auto()
+    CLEAR_HISTORY           = auto()
+    SCORE_IN_GAME           = auto()
+    SEND_PAYMENT            = auto()
+    PHONE_CALL              = auto()
+    TAKE_SCREENSHOT         = auto()
+    ATTACH_MENU_BOT_ALLOWED = auto()
+    WEB_APP_BOT_ALLOWED     = auto()
+    ALLOW_SENDING_MESSAGES  = auto()
+    SEND_PASSPORT_VALUES    = auto()
+    JOINED_TELEGRAM         = auto()
+    PROXIMITY_REACHED       = auto()
+    REQUESTED_PHONE_NUMBER  = auto()
+    GROUP_CALL              = auto()
+    INVITE_TO_GROUP_CALL    = auto()
+    SET_MESSAGES_TTL        = auto()
+    GROUP_CALL_SCHEDULED    = auto()
+    EDIT_CHAT_THEME         = auto()
+    JOIN_GROUP_BY_REQUEST   = auto()
+    SEND_WEBVIEW_DATA       = auto()
+    SEND_PREMIUM_GIFT       = auto()
+    TOPIC_CREATED           = auto()
+    TOPIC_EDIT              = auto()
+    SUGGEST_PROFILE_PHOTO   = auto()
+    REQUESTED_PEER          = auto()
+    GIFT_CODE_PRIZE         = auto()
+    GIVEAWAY_LAUNCH         = auto()
+    SET_CHAT_WALLPAPER      = auto()
+    SET_SAME_CHAT_WALLPAPER = auto()
