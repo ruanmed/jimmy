@@ -291,21 +291,29 @@ class Note:
                 # Generate a UUID - following default Dendron ID convention
                 metadata["id"] = str(uuid.uuid4().hex)[:23]
 
-                metadata["title"] = self.title
+                # Arbitrary metadata will be ignored.
+                for field in dataclasses.fields(Note):
+                    match field.name:
+                        case "title" | "author" | "latitude" | "longitude" | "altitude":
+                            if (value := getattr(self, field.name)) is not None:
+                                metadata[field.name] = value
 
-                # Convert datetime to milliseconds since epoch
-                if self.created:
-                    metadata["created"] = common.datetime_to_ms(self.created)
-                if self.updated:
-                    metadata["updated"] = int(self.updated.timestamp() * 1000)
+                        case "created" | "updated":
+                            # Convert datetime to milliseconds since epoch
+                            if (value := getattr(self, field.name)) is not None:
+                                metadata[field.name] = common.datetime_to_ms(value)
 
-                # Tags – list of strings (hierarchical if you use dots)
-                metadata["tags"] = (
-                    sorted(tag.title for tag in self.tags if tag.title)
-                )
+                        case "tags":
+                            if not self.tags:
+                                continue
+
+                            # Tags – list of strings (hierarchical if you use dots)
+                            metadata["tags"] = sorted(tag.title for tag in self.tags if tag.title)
+
+                metadata["original_id"] = self.original_id
 
                 post = frontmatter.Post(self.body, **metadata)
-                self.body = frontmatter.dumps(post)
+                self.body = frontmatter.dumps(post, sort_keys=False)
             case _:
                 LOGGER.debug(f'Ignoring unknown frontmatter "{frontmatter_}"')
 
